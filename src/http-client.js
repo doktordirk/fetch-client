@@ -1,5 +1,6 @@
 import {HttpClientConfiguration} from './http-client-configuration';
 import {RequestInit, Interceptor} from './interfaces';
+import {RetryInterceptor} from './retry-interceptor';
 
 /**
 * An HTTP client based on the Fetch API.
@@ -79,6 +80,21 @@ export class HttpClient {
       throw new Error('Default headers must be a plain object.');
     }
 
+    let interceptors = normalizedConfig.interceptors;
+
+    if (interceptors && interceptors.length ) {
+      // find if there is a RetryInterceptor
+      if (interceptors.filter( x => RetryInterceptor.prototype.isPrototypeOf(x)).length > 1) {
+        throw new Error('Only one RetryInterceptor is allowed.');
+      }
+
+      const retryInterceptorIndex = interceptors.findIndex( x => RetryInterceptor.prototype.isPrototypeOf(x));
+
+      if (retryInterceptorIndex >= 0 && retryInterceptorIndex !== interceptors.length - 1) {
+        throw new Error('The retry interceptor must be the last interceptor defined.');
+      }
+    }
+
     this.baseUrl = normalizedConfig.baseUrl;
     this.defaults = defaults;
     this.interceptors = normalizedConfig.interceptors || [];
@@ -104,24 +120,63 @@ export class HttpClient {
   fetch(input: Request|string, init?: RequestInit): Promise<Response> {
     this::trackRequestStart();
 
-    let request = Promise.resolve().then(() => this::buildRequest(input, init, this.defaults));
-    let promise = processRequest(request, this.interceptors)
+    let request = this.buildRequest(input, init);
+    return processRequest(request, this.interceptors, this)
       .then(result => {
         let response = null;
 
         if (Response.prototype.isPrototypeOf(result)) {
-          response = result;
+          response = Promise.resolve(result);
         } else if (Request.prototype.isPrototypeOf(result)) {
-          request = Promise.resolve(result);
+          request = result;
           response = fetch(result);
         } else {
           throw new Error(`An invalid result was returned by the interceptor chain. Expected a Request or Response instance, but got [${result}]`);
         }
 
-        return request.then(_request => processResponse(response, this.interceptors, _request));
+        return processResponse(response, this.interceptors, request, this);
+      })
+      .then(result => {
+        if (Request.prototype.isPrototypeOf(result)) {
+          return this.fetch(result);
+        }
+        this::trackRequestEnd();
+        return result;
       });
+  }
 
-    return this::trackRequestEndWith(promise);
+  buildRequest(input: string, init: RequestInit): Request {
+    let defaults = this.defaults || {};
+    let request;
+    let body;
+    let requestContentType;
+
+    let parsedDefaultHeaders = parseHeaderValues(defaults.headers);
+    if (Request.prototype.isPrototypeOf(input)) {
+      request = input;
+      requestContentType = new Headers(request.headers).get('Content-Type');
+    } else {
+      init || (init = {});
+      body = init.body;
+      let bodyObj = body ? { body } : null;
+      let requestInit = Object.assign({}, defaults, { headers: {} }, init, bodyObj);
+      requestContentType = new Headers(requestInit.headers).get('Content-Type');
+      request = new Request(getRequestUrl(this.baseUrl, input), requestInit);
+    }
+    if (!requestContentType) {
+      if (new Headers(parsedDefaultHeaders).has('content-type')) {
+        request.headers.set('Content-Type', new Headers(parsedDefaultHeaders).get('content-type'));
+      } else if (body && isJSON(body)) {
+        request.headers.set('Content-Type', 'application/json');
+      }
+    }
+    setDefaultHeaders(request.headers, parsedDefaultHeaders);
+    if (body && Blob.prototype.isPrototypeOf(body) && body.type) {
+      // work around bug in IE & Edge where the Blob type is ignored in the request
+      // https://connect.microsoft.com/IE/feedback/details/2136163
+      request.headers.set('Content-Type', body.type);
+    }
+    return request;
   }
 }
 
@@ -135,12 +190,6 @@ function trackRequestEnd() {
   this.isRequesting = !!(--this.activeRequestCount);
 }
 
-function trackRequestEndWith(promise) {
-  let handle = this::trackRequestEnd;
-  promise.then(handle, handle);
-  return promise;
-}
-
 function parseHeaderValues(headers) {
   let parsedHeaders = {};
   for (let name in headers || {}) {
@@ -149,40 +198,6 @@ function parseHeaderValues(headers) {
     }
   }
   return parsedHeaders;
-}
-
-function buildRequest(input, init) {
-  let defaults = this.defaults || {};
-  let request;
-  let body;
-  let requestContentType;
-
-  let parsedDefaultHeaders = parseHeaderValues(defaults.headers);
-  if (Request.prototype.isPrototypeOf(input)) {
-    request = input;
-    requestContentType = new Headers(request.headers).get('Content-Type');
-  } else {
-    init || (init = {});
-    body = init.body;
-    let bodyObj = body ? { body } : null;
-    let requestInit = Object.assign({}, defaults, { headers: {} }, init, bodyObj);
-    requestContentType = new Headers(requestInit.headers).get('Content-Type');
-    request = new Request(getRequestUrl(this.baseUrl, input), requestInit);
-  }
-  if (!requestContentType) {
-    if (new Headers(parsedDefaultHeaders).has('content-type')) {
-      request.headers.set('Content-Type', new Headers(parsedDefaultHeaders).get('content-type'));
-    } else if (body && isJSON(body)) {
-      request.headers.set('Content-Type', 'application/json');
-    }
-  }
-  setDefaultHeaders(request.headers, parsedDefaultHeaders);
-  if (body && Blob.prototype.isPrototypeOf(body) && body.type) {
-    // work around bug in IE & Edge where the Blob type is ignored in the request
-    // https://connect.microsoft.com/IE/feedback/details/2136163
-    request.headers.set('Content-Type', body.type);
-  }
-  return request;
 }
 
 function getRequestUrl(baseUrl, url) {
@@ -201,12 +216,12 @@ function setDefaultHeaders(headers, defaultHeaders) {
   }
 }
 
-function processRequest(request, interceptors) {
-  return applyInterceptors(request, interceptors, 'request', 'requestError');
+function processRequest(request, interceptors, http) {
+  return applyInterceptors(request, interceptors, 'request', 'requestError', http);
 }
 
-function processResponse(response, interceptors, request) {
-  return applyInterceptors(response, interceptors, 'response', 'responseError', request);
+function processResponse(response, interceptors, request, http) {
+  return applyInterceptors(response, interceptors, 'response', 'responseError', request, http);
 }
 
 function applyInterceptors(input, interceptors, successName, errorName, ...interceptorArgs) {

@@ -43,7 +43,7 @@ interface Interceptor {
    * previous interceptor.
    * @returns The response; or a Promise for one.
    */
-  responseError?: (error: any, request?: Request) => Response|Promise<Response>;
+  responseError?: (error: any, request?: Request, httpClient? : HttpClient) => Response|Promise<Response>;
 }
 
 /**
@@ -95,4 +95,19 @@ interface RequestInit {
   * Contains the subresource integrity value of the request (e.g., sha256-BpfBw7ivV8q2jLiT13fxDYAe2tJllusRSZ273h2nFSE=).
   */
   integrity?: string;
+
+  /**
+   * An AbortSignal to set request’s signal.
+   */
+  signal?: AbortSignal;
+}
+
+interface RetryConfiguration {
+  maxRetries: number;
+  interval?: number;
+  strategy?: number|(retryCount: number) => number;
+  minRandomInterval?: number;
+  maxRandomInterval?: number;
+  doRetry?: (response: Response, request: Request) => boolean | Promise<boolean>;
+  beforeRetry?: (request: Request, client: HttpClient) => Request | Promise<Request>;
 }
