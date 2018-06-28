@@ -39,7 +39,7 @@
       "aurelia-polyfills": "^1.0.0-beta.2.0.0"
     }
   },
-  "dependencies": {
+  "peerDependencies": {
     "aurelia-pal": "^1.3.0"
   },
   "devDependencies": {
